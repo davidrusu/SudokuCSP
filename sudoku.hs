@@ -1,16 +1,28 @@
-import Control.Monad (replicateM, mapM_)
+import Control.Monad (replicateM, mapM_, forever)
 import Data.List (tails, find, delete, sortBy)
-import Debug.Trace (trace)
+import Data.Time.Clock.POSIX
+import Debug.Trace (trace);
+import qualified Data.Map as Map
 data Puzzle = Puzzle Int [[Int]] deriving (Eq)
 type Var = (Int, Int) -- index into grid
 type Domain = [Int]
+
+timeInMicros :: IO Integer
+timeInMicros = do
+  t <- getPOSIXTime
+  let micros = round $ (t * 1000000)
+  pure micros
+
+
+timeInMillis :: IO Integer
+timeInMillis = (`div` 1000) <$> timeInMicros
 
 data Rule = Neq Var Var | Const Var Int deriving (Eq)
 
 data CSP = CSP { vars :: [Var]
                , constraints :: [Rule]
-               , assigns :: [(Var, Int)]
-               , domains :: [(Var, Domain)]
+               , assigns :: Map.Map Var Int
+               , domains :: Map.Map Var Domain
                , puzzle :: Puzzle
                } deriving (Eq)
 
@@ -26,7 +38,9 @@ rowConstraint n r = concatMap genConstraints $ tails indices
 
 squareConstraint n rOffset cOffset = map (\(Neq (r, c) (r2, c2)) -> Neq (r + rOffset, c + cOffset) (r2 + rOffset, c2 + cOffset)) constraints
   where nD3 = n `div` 3
-        constraints = concatMap (rowConstraint nD3) [0..(nD3 - 1)]
+        coords = concatMap (\r-> map (\c-> (r, c)) [0..(nD3-1)]) [0..(nD3-1)]
+        constraints :: [Rule]
+        constraints = concatMap (\v1 -> map (\v2 -> Neq v1 v2) (filter (/= v1) coords)) coords
 
 genConstraints :: Puzzle -> [Rule]
 genConstraints (Puzzle n grid) = rowConstraints ++ colConstraints ++ squareConstraints ++ constConstraints
@@ -80,8 +94,8 @@ showPuzzle (Puzzle n grid) =
 buildCSP :: Puzzle -> CSP
 buildCSP puzzle@(Puzzle n grid) = CSP { vars = vars
                                       , constraints = genConstraints puzzle
-                                      , assigns = map (\v -> (v, -1)) vars
-                                      , domains = map (\v -> (v, [1..n])) vars
+                                      , assigns = Map.fromList $ map (\v -> (v, -1)) vars
+                                      , domains = Map.fromList $ map (\v -> (v, [1..n])) vars
                                       , puzzle = puzzle
                                       }
   where vars = variables n
@@ -98,18 +112,15 @@ update n f (x:xs) | n < 0 = undefined
 
 restrictDomainConst :: CSP -> Var -> Int -> CSP
 restrictDomainConst csp var val =
-  csp { domains = replace (\(v, dom) -> v == var) (\(v, dom) -> (v, [val])) (domains csp) }
+  csp { domains = Map.update (const $ Just [val]) var (domains csp) }
 
 
 restrictDomainNeq :: CSP -> Var -> Var -> CSP
 restrictDomainNeq csp var1 var2 =
-  case find (\(v, _) -> v == var1) $ domains csp of
-       Just (_, dom1) -> csp {
-         domains = replace
-                     (\(v, dom) -> v == var2)
-                     (\(v, dom2) -> (v, restrict dom1 dom2 ))
-                     (domains csp) }
-       _ -> undefined
+  case Map.lookup var1 $ domains csp of
+       Just dom1 -> csp {
+         domains = Map.update (\dom2 -> Just $ restrict dom1 dom2) var2 (domains csp) }
+       Nothing -> undefined
   where neqExists x xs = any (/= x) xs
         restrict :: [Int] -> [Int] -> [Int]
         restrict dom1 dom2 = foldl (\d v-> if neqExists v dom1 then d else delete v d ) dom2 dom2
@@ -132,89 +143,102 @@ allArcs csp v = map (\v2-> (v, v2)) varsToAdd
                        _ -> False) $ constraints csp
         varsToAdd = map (\(Neq v1 v2) -> if v1 == v then v2 else v1) cs
 
-ac3 :: CSP -> [(Var, Var)] -> CSP
-ac3 csp [] = csp
-ac3 csp arcs = ac3 newCSP newArcs
+anyEmptyDomains csp = (Map.size $ Map.filter (\dom -> length dom == 0) (domains csp)) > 0
+
+ac3 :: CSP -> [(Var, Var)] -> Maybe CSP
+ac3 csp [] = Just csp
+ac3 csp arcs = if anyEmptyDomains csp
+               then Nothing
+               else ac3 newCSP newArcs
   where (newCSP, newArcs) = foldl (\(csp, queue) (var1, var2) -> let csp2 = restrictDomainNeq csp var1 var2 in
-                                     if (domains csp2) /= (domains csp) then (csp2, queue ++ (allArcs csp2 var2)) else (csp2, queue)) (csp, []) arcs
+                                     if (getDomain csp2 var2) /= (getDomain csp var2) then (csp2, queue ++ (allArcs csp2 var2)) else (csp2, queue)) (csp, []) arcs
 
 fillIn :: CSP -> Puzzle
 fillIn csp = Puzzle n assignedGrid
   where
-    certain = filter (\(v, dom)-> length dom == 1) $ domains csp
+    certain = Map.filter (\dom -> length dom == 1) $ domains csp
     initGrid = replicate n $ replicate n 0
-    assignedGrid = foldl (\grid ((r, c), val) -> update r (update c (const val)) grid) initGrid (filter (\(_, v) -> v > 0) $ assigns csp)
+    assignedGrid =
+      Map.foldWithKey
+        (\(r, c) val grid -> update r (update c (const val)) grid)
+        initGrid
+        (Map.filter (> 0) $ assigns csp)
     -- filledGrid = foldl (\grid ((r, c), [val]) -> update r (update c (const val)) grid) assignedGrid certain
     Puzzle n _ = puzzle csp
 
 getDomain :: CSP -> Var -> Domain
-getDomain csp var = case find (\(v, d) -> v == var) $ domains csp of
-  Just (v, d) -> d
+getDomain csp var = case Map.lookup var $ domains csp of
+  Just d -> d
   Nothing -> undefined
 
 getConstraints :: CSP -> Var -> Var -> [Rule]
 getConstraints csp v1 v2 = filter (\(Neq v3 v4) -> v1 == v3  && v2 == v4) $ constraints csp
 
-constraintsHold :: [(Var, Int)] -> [Rule] -> Bool
+constraintsHold :: Map.Map Var Int -> [Rule] -> Bool
 constraintsHold vars [] = True
-constraintsHold [] _ = True
 constraintsHold vars ((Neq v1 v2):rs) =
-  case (find (\(var, _) -> v1 == var) vars, find (\(var, _) -> v2 == var) vars) of
-    (Just (_, assign1), Just (_, assign2)) ->
-      assign1 > 0 && assign2 > 0 &&  assign1 /= assign2 && (constraintsHold vars rs)
+  case (Map.lookup v1 vars, Map.lookup v2 vars) of
+    (Just val1, Just val2) ->
+      val1 > 0 && val2 > 0 && val1 /= val2 && (constraintsHold vars rs)
     _ ->
-      undefined
+      error "blah"
 constraintsHold vars ((Const var val):rs) =
-  case find (\(v, _) -> v == var) vars of
-    Just (_, assign1) ->
-      assign1 == val  && (constraintsHold vars rs)
+  case Map.lookup var vars of
+    Just val1 ->
+      val1 == val  && (constraintsHold vars rs)
     _ ->
       undefined
-
 
 updateAssigns :: CSP -> (Var, Int) -> CSP
 updateAssigns csp (var, val) = csp { assigns = newAssigns }
   where
-    newAssigns :: [(Var, Int)]
-    newAssigns =
-          replace (\(v,_) -> v == var) (const (var, val)) $ assigns csp
+    newAssigns :: Map.Map Var Int
+    newAssigns = Map.update (const $ Just val) var $ assigns csp
 
 testAssign :: CSP -> (Var, Int) -> Bool
-testAssign csp (var, assign) = trace (showPuzzle $ fillIn csp) $ constraintsHold newAssigns $
-                                                (concatMap (\(v, _) -> getConstraints csp v var) newAssigns) ++
-                                                (concatMap (\(v, _) -> getConstraints csp var v) newAssigns)
+testAssign csp (var, assign) = constraintsHold updatedAssigns relaventConstraints
   where
-    newAssigns :: [(Var, Int)]
-    newAssigns = filter (\(var, val) -> val > 0) $ assigns $ updateAssigns csp (var, assign)
+    updatedAssigns = assigns $ updateAssigns csp (var, assign)
+    newAssigns :: [Var]
+    newAssigns = map fst $ Map.toList $ Map.filter (> 0) $ updatedAssigns
+    relaventConstraints =
+      (concatMap (\v -> getConstraints csp v var) $ newAssigns) ++
+      (concatMap (\v -> getConstraints csp var v) $ newAssigns)
 
 selectUnassignedVar csp =
   fst $ head $
   sortBy (\(v1,_) (v2,_) ->
             compare (length (getDomain csp v1)) (length (getDomain csp v2))) $
-  filter (\(var, assign) -> assign <= 0) (assigns csp)
+  Map.toList $ Map.filter (<= 0) (assigns csp)
 
 solve :: CSP -> Maybe CSP
-solve csp = if constraintsHold (assigns csp) (constraints csp) then Just csp else
-              if consistantValues == [] then trace "no consistant vals" Nothing else
-                case dropWhile (== Nothing) potentialSolutions of
-                  [] -> trace "actually no sols" Nothing
-                  (Just csp):_ -> Just csp
+solve csp = if (Map.size $ Map.filter (<= 0) (assigns csp)) == 0 then Just csp else
+              if anyEmptyDomains csp then Nothing else
+                if consistantValues == [] then Nothing else
+                  case dropWhile (== Nothing) potentialSolutions of
+                    [] -> Nothing
+                    (Just csp):_ -> Just csp
   where
     var = selectUnassignedVar csp
-    consistantValues = trace (show var ++ " in " ++ (show $ getDomain csp var)) $
-                       filter (\val -> testAssign csp (var, val)) (getDomain csp var)
+    consistantValues = filter (\val -> testAssign csp (var, val)) (getDomain csp var)
     arcs = allArcs csp var
     potentialSolutions = map (\val ->
-                                solve $ ac3 (updateAssigns csp (var, val)) arcs) consistantValues
+                                (ac3 (updateAssigns csp (var, val)) arcs) >>= solve ) consistantValues
+
+everyArc csp = concatMap (\var -> allArcs csp var) $ vars csp
 
 main = do
+  tStart <- timeInMillis
+  
   puzzle <- parsePuzzle
   let csp = buildCSP puzzle
   let nodeCsp = nodeConsistant csp
-  let ac3Csp = ac3 nodeCsp $ concatMap (\var -> allArcs nodeCsp var) $ vars nodeCsp
-  print (domains ac3Csp)
+  let ac3Csp = ac3 nodeCsp $ everyArc nodeCsp
+  
   putStrLn $ showPuzzle puzzle
-  putStrLn $ showPuzzle $ fillIn ac3Csp
-  case solve $ ac3Csp of
+  case ac3Csp >>= solve of
     Just csp -> putStrLn $ showPuzzle $ fillIn csp
     Nothing -> putStrLn "Failed to solve"
+  
+  tFinish <- timeInMillis
+  putStrLn ("Time solve: " ++ (show (tFinish - tStart)) ++ "millis")
